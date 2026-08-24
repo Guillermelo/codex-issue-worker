@@ -116,8 +116,10 @@ GET  /jobs
 
 POST /scan
 POST /solve
-POST /webhook/github
 ```
+
+`POST /webhook/github` is intentionally reserved for a later release. Polling and
+the two manual endpoints are the V1 trigger mechanisms.
 
 ## Configuration
 
@@ -274,6 +276,10 @@ packer fmt -check .
 packer validate .
 ```
 
+The provided image includes Python and Node/npm tooling. Go, Terraform, Packer,
+and any repository-specific validators must be added in a derived image when
+those tools are needed; a missing validator causes validation to fail closed.
+
 ## State
 
 V1 uses SQLite.
@@ -386,6 +392,74 @@ First-time login:
 docker compose exec agent gh auth login
 docker compose exec agent codex login
 ```
+
+## Quick Start
+
+1. Build and start the service:
+
+   ```bash
+   docker compose build
+   docker compose up -d
+   ```
+
+2. Authenticate GitHub and Codex once. Their login directories are stored in
+   named Docker volumes and survive container restarts:
+
+   ```bash
+   docker compose exec agent gh auth login
+   docker compose exec agent codex login
+   ```
+
+3. Edit `config.yaml` and replace `owner/repository` with each allowed GitHub
+   repository. The short form uses safe validation detection:
+
+   ```yaml
+   repos:
+     - your-name/your-repository
+   ```
+
+   Trusted validation commands can instead be set explicitly per repository:
+
+   ```yaml
+   repos:
+     - repo: your-name/your-repository
+       validation_commands:
+         - pytest
+         - ruff check .
+   ```
+
+   Commands are parsed as argument lists and run without a shell, so shell
+   operators such as pipes and redirects are not supported. Apply configuration
+   changes with:
+
+   ```bash
+   docker compose restart agent
+   ```
+
+4. Add the `agent-ready` label to an open issue in an allowed repository. Wait
+   for the polling interval, or trigger a scan immediately:
+
+   ```bash
+   curl -X POST http://localhost:8080/scan
+   ```
+
+   A specific allowed issue can also be queued manually:
+
+   ```bash
+   curl -X POST http://localhost:8080/solve \
+     -H 'Content-Type: application/json' \
+     -d '{"repo":"your-name/your-repository","issue":42}'
+   ```
+
+5. Inspect service logs and persisted job state:
+
+   ```bash
+   docker compose logs -f agent
+   curl http://localhost:8080/jobs
+   ```
+
+   A successful job reports `status: completed` and its `pr_url`. Open that URL
+   to review the Pull Request; the agent never merges it.
 
 ## Safety rules
 
@@ -519,4 +593,3 @@ Everything after that is an optimization.
 ## License
 
 MIT
-

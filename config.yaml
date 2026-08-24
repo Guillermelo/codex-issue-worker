@@ -1,0 +1,18 @@
+poll_interval_seconds: 300
+max_concurrent_jobs: 1
+issue_label: agent-ready
+workspace_root: /workspace
+database_path: /data/agent.db
+max_attempts: 2
+command_timeout_seconds: 1800
+codex_timeout_seconds: 3600
+comment_on_failure: false
+keep_workspace_on_failure: false
+
+repos:
+  - owner/repository
+  # To override safe validation detection for a repository, use:
+  # - repo: owner/another-repository
+  #   validation_commands:
+  #     - pytest
+  #     - ruff check .

@@ -1,0 +1,25 @@
+services:
+  agent:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - agent-data:/data
+      - agent-workspace:/workspace
+      - agent-gh-config:/root/.config/gh
+      - agent-codex-config:/root/.codex
+    environment:
+      CONFIG_FILE: /app/config.yaml
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      GIT_AUTHOR_NAME: ${GIT_AUTHOR_NAME:-GitHub Issue Agent}
+      GIT_AUTHOR_EMAIL: ${GIT_AUTHOR_EMAIL:-issue-agent@localhost}
+      GIT_COMMITTER_NAME: ${GIT_COMMITTER_NAME:-GitHub Issue Agent}
+      GIT_COMMITTER_EMAIL: ${GIT_COMMITTER_EMAIL:-issue-agent@localhost}
+
+volumes:
+  agent-data:
+  agent-workspace:
+  agent-gh-config:
+  agent-codex-config:
