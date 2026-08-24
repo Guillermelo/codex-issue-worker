@@ -2,6 +2,53 @@
 
 A lightweight self-hosted agent that watches GitHub repositories for eligible issues, clones the repository, asks OpenAI Codex CLI to solve the issue, runs validation, and opens a Pull Request.
 
+## Why this project uses Codex CLI
+
+This project intentionally invokes the locally installed Codex CLI with
+`codex exec`. It does not implement an OpenAI API integration and does not
+require an `OPENAI_API_KEY` when Codex is authenticated with the existing
+ChatGPT/Codex login.
+
+The goal is to use the Codex access already available through the operator's
+ChatGPT/Codex account instead of creating a separate token-metered OpenAI API
+integration. This does not mean Codex usage is unlimited or universally free:
+an eligible account or subscription is still required, account usage limits
+still apply, and OpenAI product terms may change. If Codex is authenticated
+with an API key instead, that API account's normal billing and limits apply.
+
+## Security warning
+
+This worker is privileged automation, not a security boundary. It can read
+issue content, clone source code, run Codex, execute repository validation
+commands, create commits, push branches, and open Pull Requests with the
+permissions of the authenticated GitHub identity.
+
+Run it only on a machine or VM you control, and assume that issue bodies,
+comments, repository files, dependencies, build scripts, and test scripts may
+be untrusted. Container isolation reduces accidental workspace contamination,
+but the container still has network access and persistent GitHub and Codex
+credentials.
+
+Recommended operating rules:
+
+- Use a dedicated GitHub identity or fine-grained credential with access only
+  to the repositories this worker must modify.
+- Do not grant organization administration, production deployment, package
+  publishing, secrets management, or unrelated repository access.
+- Restrict who can add the configured `agent-ready` label. Adding that label is
+  equivalent to requesting an automated code execution job.
+- Keep the repository allowlist small and review every configured repository.
+- Do not mount the Docker socket, SSH keys, cloud credentials, production
+  `.env` files, or host directories containing secrets into the container.
+- Keep the FastAPI port private. V1 has no API authentication, so `/scan` and
+  `/solve` must not be exposed directly to the internet or an untrusted LAN.
+- Protect the Docker host and the named authentication volumes. Anyone who can
+  access them may be able to reuse the stored credentials.
+- Review every generated Pull Request and its CI results before merging. This
+  project never merges automatically.
+- Confirm that using Codex with private repository content is compatible with
+  your organization's data handling and compliance requirements.
+
 ## Architecture
 
 ```text
@@ -319,6 +366,15 @@ codex login
 
 Persist GitHub CLI and Codex authentication directories as Docker volumes.
 
+The authenticated GitHub identity defines the worker's effective permissions.
+The repository allowlist limits what the application selects, but it does not
+reduce the underlying token scopes. Prefer least-privilege GitHub access rather
+than relying on the allowlist as the only control.
+
+The default setup expects interactive `codex login` authentication backed by
+the operator's ChatGPT/Codex account. It intentionally does not configure or
+read an OpenAI API key.
+
 The worker should detect authentication failures and mark the job `auth_required` instead of retrying forever.
 
 ## Suggested project structure
@@ -359,7 +415,7 @@ services:
     restart: unless-stopped
 
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
 
     volumes:
       - agent-data:/data
@@ -402,9 +458,13 @@ docker compose exec agent codex login
    docker compose up -d
    ```
 
-   The API uses host port `8080` by default. If that port is occupied, set a
-   different one in `.env` before starting, for example `AGENT_PORT=8081`, and
-   use that port in the `curl` commands below.
+   The API listens on `127.0.0.1:8080` by default. If that port is occupied,
+   set a different one in `.env` before starting, for example
+   `AGENT_PORT=8081`, and use that port in the `curl` commands below.
+
+   `AGENT_BIND_ADDRESS` defaults to `127.0.0.1` because V1 has no API
+   authentication. Do not change it to `0.0.0.0` unless access is protected by
+   a trusted firewall, private network, or authenticated reverse proxy.
 
 2. Authenticate GitHub and Codex once. Their login directories are stored in
    named Docker volumes and survive container restarts:
@@ -466,23 +526,28 @@ docker compose exec agent codex login
    A successful job reports `status: completed` and its `pr_url`. Open that URL
    to review the Pull Request; the agent never merges it.
 
-## Safety rules
+## Implemented safety controls
 
-V1 should enforce:
+V1 enforces:
 
 - one worker only;
 - explicit repository allowlist;
 - only `agent-ready` issues;
 - no direct pushes to protected branches;
 - no automatic merge;
-- no production credentials;
-- no arbitrary shell commands from webhook payloads;
+- no credentials bundled in the image or repository;
+- no commands taken from issue text or comments;
 - per-job isolated workspaces;
 - maximum attempts;
 - execution timeout;
 - cleanup after each job;
-- webhook signature verification;
 - logs without credentials or tokens.
+
+These controls do not make arbitrary repository code safe. Validation commands
+come from trusted local configuration or conservative file-based detection, but
+commands such as `npm test` and `pytest` execute code from the cloned
+repository. Use a dedicated host or VM when processing repositories that are
+not fully trusted. Webhooks and webhook signature verification are outside V1.
 
 ## Workspace isolation
 
