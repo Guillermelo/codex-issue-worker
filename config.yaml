@@ -10,7 +10,8 @@ comment_on_failure: false
 keep_workspace_on_failure: false
 
 repos:
-  - owner/repository
+  - repo: KALPA-S-A/mobiiby-taxi-backend-api
+    base_branch: Stateless+Gracefull
   # To override safe validation detection for a repository, use:
   # - repo: owner/another-repository
   #   validation_commands:

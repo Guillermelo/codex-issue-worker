@@ -56,16 +56,37 @@ Requirements:
 - Do not modify unrelated code.
 - Never expose or commit secrets.
 - Do not commit or push; the wrapper handles Git operations.
+
+Your final response will be used in the Pull Request description. It must:
+- Start with 2-5 concise bullets explaining behavior changed and why.
+- Include a `### Configuration and rollout` section with exact environment
+  variable names, safe example values, required deployment/restart steps, and
+  a verification step.
+- Explicitly say when no operator action is required.
+- Never include secret values or merely repeat a list of changed files.
 """
 
-    async def run(self, workspace: Path, repo: str, issue: IssueContext) -> None:
+    async def run(self, workspace: Path, repo: str, issue: IssueContext) -> str:
         prompt = self.build_prompt(repo, issue)
+        final_message_path = workspace / ".codex-final-message.md"
         try:
             await run_command(
-                ["codex", "exec", "--full-auto", "-C", str(workspace), "-"],
+                [
+                    "codex",
+                    "exec",
+                    "--approve-for-me",
+                    "--output-last-message",
+                    str(final_message_path),
+                    "-C",
+                    str(workspace),
+                    "-",
+                ],
                 timeout=self.timeout_seconds,
                 input_text=prompt,
             )
+            if not final_message_path.is_file():
+                return ""
+            return final_message_path.read_text(encoding="utf-8").strip()[:8000]
         except CommandError as exc:
             message = f"{exc.result.stderr}\n{exc.result.stdout}".lower()
             if any(marker in message for marker in AUTH_MARKERS):
@@ -73,3 +94,5 @@ Requirements:
                     "Codex authentication is required; run codex login"
                 ) from exc
             raise
+        finally:
+            final_message_path.unlink(missing_ok=True)

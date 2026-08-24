@@ -17,7 +17,10 @@ class FakeGit:
     def workspace_path(self, repo: str, issue_number: int) -> Path:
         return self.root / f"owner-repo-{issue_number}-fake"
 
-    async def clone(self, repo: str, destination: Path) -> None:
+    async def clone(
+        self, repo: str, destination: Path, base_branch: str | None = None
+    ) -> None:
+        assert base_branch == "Stateless+Gracefull"
         destination.mkdir(parents=True)
 
     async def create_branch(self, workspace: Path, issue_number: int) -> str:
@@ -26,10 +29,10 @@ class FakeGit:
     async def has_changes(self, workspace: Path) -> bool:
         return True
 
-    async def has_committed_changes(self, workspace: Path) -> bool:
+    async def has_committed_changes(self, workspace: Path, base_ref: str) -> bool:
         return False
 
-    async def committed_change_summary(self, workspace: Path) -> str:
+    async def committed_change_summary(self, workspace: Path, base_ref: str) -> str:
         return "2 files changed"
 
     async def commit_changes(
@@ -45,7 +48,8 @@ class ExistingBranchGit(FakeGit):
     async def has_changes(self, workspace: Path) -> bool:
         return False
 
-    async def has_committed_changes(self, workspace: Path) -> bool:
+    async def has_committed_changes(self, workspace: Path, base_ref: str) -> bool:
+        assert base_ref == "origin/Stateless+Gracefull"
         return True
 
     async def commit_changes(
@@ -59,15 +63,31 @@ class FakeGitHub:
         return IssueContext(number=issue_number, title="Fix the bug")
 
     async def create_pull_request(
-        self, repo: str, title: str, body: str, branch: str
+        self,
+        repo: str,
+        title: str,
+        body: str,
+        branch: str,
+        base_branch: str | None = None,
     ) -> str:
         assert f"Closes #{branch.rsplit('-', 1)[-1]}" in body
+        assert "- Added safe mock behavior." in body
+        assert "### Configuration and rollout" in body
+        assert "Set `LOAD_TEST_MODE=true`." in body
+        assert "## Changed files" in body
+        assert "```text\n2 files changed\n```" in body
+        assert "## Validation" in body
+        assert "- `pytest`" in body
+        assert base_branch == "Stateless+Gracefull"
         return "https://github.com/owner/repo/pull/1"
 
 
 class FakeCodex:
-    async def run(self, workspace: Path, repo: str, issue: IssueContext) -> None:
-        return None
+    async def run(self, workspace: Path, repo: str, issue: IssueContext) -> str:
+        return (
+            "- Added safe mock behavior.\n\n"
+            "### Configuration and rollout\nSet `LOAD_TEST_MODE=true`."
+        )
 
 
 class AuthRequiredCodex:
@@ -84,7 +104,13 @@ class PassingValidator:
 
 def make_config(tmp_path: Path) -> AgentConfig:
     return AgentConfig(
-        repos=[{"repo": "owner/repo", "validation_commands": ["pytest"]}],
+        repos=[
+            {
+                "repo": "owner/repo",
+                "base_branch": "Stateless+Gracefull",
+                "validation_commands": ["pytest"],
+            }
+        ],
         workspace_root=tmp_path / "workspaces",
         database_path=tmp_path / "agent.db",
     )

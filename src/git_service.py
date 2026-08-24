@@ -19,19 +19,28 @@ class GitService:
         suffix = uuid.uuid4().hex[:8]
         return self.workspace_root / f"{safe_repo}-{issue_number}-{suffix}"
 
-    async def clone(self, repo: str, destination: Path) -> None:
+    async def clone(
+        self, repo: str, destination: Path, base_branch: str | None = None
+    ) -> None:
         self.workspace_root.mkdir(parents=True, exist_ok=True)
+        clone_arguments = [
+            "gh",
+            "repo",
+            "clone",
+            repo,
+            str(destination),
+            "--",
+            "--depth=1",
+        ]
+        if base_branch:
+            clone_arguments.extend(["--branch", base_branch, "--single-branch"])
         try:
             await run_command(
-                [
-                    "gh",
-                    "repo",
-                    "clone",
-                    repo,
-                    str(destination),
-                    "--",
-                    "--depth=1",
-                ],
+                ["gh", "auth", "setup-git"],
+                timeout=self.timeout_seconds,
+            )
+            await run_command(
+                clone_arguments,
                 timeout=self.timeout_seconds,
             )
         except CommandError as exc:
@@ -78,9 +87,9 @@ class GitService:
         )
         return bool(result.stdout.strip())
 
-    async def has_committed_changes(self, workspace: Path) -> bool:
+    async def has_committed_changes(self, workspace: Path, base_ref: str) -> bool:
         result = await run_command(
-            ["git", "diff", "--quiet", "origin/HEAD", "HEAD"],
+            ["git", "diff", "--quiet", base_ref, "HEAD"],
             cwd=workspace,
             timeout=self.timeout_seconds,
             check=False,
@@ -89,9 +98,9 @@ class GitService:
             raise CommandError(result)
         return result.returncode == 1
 
-    async def committed_change_summary(self, workspace: Path) -> str:
+    async def committed_change_summary(self, workspace: Path, base_ref: str) -> str:
         result = await run_command(
-            ["git", "diff", "--stat", "origin/HEAD", "HEAD"],
+            ["git", "diff", "--stat", base_ref, "HEAD"],
             cwd=workspace,
             timeout=self.timeout_seconds,
         )

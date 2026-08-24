@@ -26,6 +26,7 @@ class RepositoryConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     repo: str
+    base_branch: str | None = None
     validation_commands: list[str] | None = None
 
     @field_validator("repo")
@@ -33,6 +34,24 @@ class RepositoryConfig(BaseModel):
     def validate_repo(cls, value: str) -> str:
         if not REPOSITORY_PATTERN.fullmatch(value):
             raise ValueError("repository must use the owner/name format")
+        return value
+
+    @field_validator("base_branch")
+    @classmethod
+    def validate_base_branch(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        forbidden_characters = set(" ~^:?*[\\")
+        if (
+            not value
+            or value.startswith("-")
+            or value.endswith(("/", ".", ".lock"))
+            or any(part in value for part in ("..", "@{", "//"))
+            or any(character in forbidden_characters for character in value)
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
+            raise ValueError("base_branch is not a valid Git branch name")
         return value
 
     @field_validator("validation_commands")

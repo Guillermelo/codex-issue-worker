@@ -104,22 +104,28 @@ class GitHubClient:
         return pulls[0]["url"] if pulls else None
 
     async def create_pull_request(
-        self, repo: str, title: str, body: str, branch: str
+        self,
+        repo: str,
+        title: str,
+        body: str,
+        branch: str,
+        base_branch: str | None = None,
     ) -> str:
-        output = await self._gh(
-            [
-                "pr",
-                "create",
-                "--repo",
-                repo,
-                "--head",
-                branch,
-                "--title",
-                title,
-                "--body",
-                body,
-            ]
-        )
+        arguments = [
+            "pr",
+            "create",
+            "--repo",
+            repo,
+            "--head",
+            branch,
+            "--title",
+            title,
+            "--body",
+            body,
+        ]
+        if base_branch:
+            arguments.extend(["--base", base_branch])
+        output = await self._gh(arguments)
         urls = URL_PATTERN.findall(output)
         if not urls:
             raise RuntimeError("GitHub CLI did not return a Pull Request URL")

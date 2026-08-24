@@ -23,10 +23,13 @@ TOKEN_PATTERNS = (
 
 
 def sanitize_error(error: BaseException) -> str:
-    message = str(error)
+    return sanitize_text(str(error), 4000)
+
+
+def sanitize_text(message: str, limit: int) -> str:
     for pattern in TOKEN_PATTERNS:
         message = pattern.sub("[REDACTED]", message)
-    return message[:4000]
+    return message[:limit]
 
 
 class JobFailure(RuntimeError):
@@ -101,15 +104,18 @@ class Worker:
         failed = True
         try:
             logger.info("Processing %s#%s", request.repo, request.issue_number)
-            await self.git.clone(request.repo, workspace)
+            repository = self.config.repository(request.repo)
+            await self.git.clone(request.repo, workspace, repository.base_branch)
             branch = await self.git.create_branch(workspace, request.issue_number)
             issue = await self.github.get_issue(request.repo, request.issue_number)
-            await self.codex.run(workspace, request.repo, issue)
+            codex_report = await self.codex.run(workspace, request.repo, issue)
 
             has_working_changes = await self.git.has_changes(workspace)
             has_committed_changes = (
                 not has_working_changes
-                and await self.git.has_committed_changes(workspace)
+                and await self.git.has_committed_changes(
+                    workspace, self._base_ref(repository.base_branch)
+                )
             )
             if not has_working_changes and not has_committed_changes:
                 await self.database.finish_job(
@@ -121,17 +127,18 @@ class Worker:
                 failed = False
                 return
 
-            repository = self.config.repository(request.repo)
             validation = await self.validator.validate(
                 workspace, repository.validation_commands
             )
             if not validation.passed:
                 raise JobFailure(validation.error or "Validation failed")
 
-            change_summary = (
+            changed_files = (
                 await self.git.commit_changes(workspace, branch, request.issue_number)
                 if has_working_changes
-                else await self.git.committed_change_summary(workspace)
+                else await self.git.committed_change_summary(
+                    workspace, self._base_ref(repository.base_branch)
+                )
             )
             validation_summary = "\n".join(
                 f"- `{command}`" for command in validation.commands
@@ -139,13 +146,19 @@ class Worker:
             body = (
                 f"Closes #{request.issue_number}\n\n"
                 "## Summary\n\n"
-                f"{change_summary}\n\n"
+                f"{sanitize_text(codex_report, 8000) or changed_files}\n\n"
+                "## Changed files\n\n"
+                f"```text\n{changed_files}\n```\n\n"
                 "## Validation\n\n"
                 f"{validation_summary}"
             )
             title = f"Fix #{request.issue_number}: {issue.title}"[:256]
             pr_url = await self.github.create_pull_request(
-                request.repo, title, body, branch
+                request.repo,
+                title,
+                body,
+                branch,
+                repository.base_branch,
             )
             await self.database.finish_job(
                 job.id,
@@ -204,3 +217,7 @@ class Worker:
     @property
     def queued_count(self) -> int:
         return self.queue.qsize()
+
+    @staticmethod
+    def _base_ref(base_branch: str | None) -> str:
+        return f"origin/{base_branch}" if base_branch else "origin/HEAD"

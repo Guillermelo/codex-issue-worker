@@ -402,6 +402,10 @@ docker compose exec agent codex login
    docker compose up -d
    ```
 
+   The API uses host port `8080` by default. If that port is occupied, set a
+   different one in `.env` before starting, for example `AGENT_PORT=8081`, and
+   use that port in the `curl` commands below.
+
 2. Authenticate GitHub and Codex once. Their login directories are stored in
    named Docker volumes and survive container restarts:
 
@@ -423,6 +427,7 @@ docker compose exec agent codex login
    ```yaml
    repos:
      - repo: your-name/your-repository
+       base_branch: Stateless+Gracefull
        validation_commands:
          - pytest
          - ruff check .

@@ -17,6 +17,7 @@ workspace_root: /tmp/workspaces
 repositories:
   - owner/simple
   - repo: owner/configured
+    base_branch: Stateless+Gracefull
     validation_commands:
       - pytest
 """,
@@ -27,6 +28,7 @@ repositories:
 
     assert config.allowed_repositories == {"owner/simple", "owner/configured"}
     assert config.repository("owner/configured").validation_commands == ["pytest"]
+    assert config.repository("owner/configured").base_branch == "Stateless+Gracefull"
 
 
 @pytest.mark.parametrize(
@@ -35,6 +37,7 @@ repositories:
         {"max_concurrent_jobs": 2},
         {"repos": ["not-a-repository"]},
         {"repos": ["owner/repo", "owner/repo"]},
+        {"repos": [{"repo": "owner/repo", "base_branch": "bad branch"}]},
     ],
 )
 def test_rejects_unsafe_configuration(overrides: dict[str, object]) -> None:
