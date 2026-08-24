@@ -51,35 +51,45 @@ Recommended operating rules:
 
 ## Architecture
 
-```text
-GitHub Issues
-      |
-      v
-Self-hosted Agent
-      |
-      +-- polling / webhook
-      |
-      v
-Clone repository
-      |
-      v
-Codex CLI
-      |
-      v
-Modify code
-      |
-      v
-Run tests / validation
-      |
-   +--+--+
-   |     |
- FAIL   PASS
-   |     |
-   v     v
-comment  push branch
-issue       |
-            v
-        create PR
+```mermaid
+flowchart LR
+    subgraph github[GitHub]
+        issue[Open issue<br/>agent-ready]
+        branch[Agent branch]
+        pr[Pull Request]
+    end
+
+    subgraph container[Self-hosted Docker container]
+        scheduler[Polling scheduler]
+        api[FastAPI<br/>manual control]
+        queue[Async job queue<br/>single worker]
+        worker[Job worker]
+        database[(SQLite)]
+        gh[GitHub CLI]
+        codex[Codex CLI]
+        validation[Deterministic validation]
+    end
+
+    subgraph workspace[Isolated temporary workspace]
+        checkout[Fresh repository clone]
+        changes[Issue-specific changes]
+    end
+
+    issue -->|poll by label| scheduler
+    scheduler --> queue
+    api -->|scan or solve| queue
+    queue --> worker
+    worker <--> database
+    worker --> gh
+    gh -->|clone configured base branch| checkout
+    worker -->|issue context| codex
+    codex --> changes
+    checkout --> changes
+    changes --> validation
+    validation -->|pass| gh
+    gh -->|commit and push| branch
+    branch --> pr
+    gh -->|create, never merge| pr
 ```
 
 The agent is designed to run inside Docker on a personal computer, home server, VPS, or Linux VM.
@@ -112,15 +122,13 @@ agent-ready
 
 Flow:
 
-```text
-Issue created
-    |
-    v
-Human adds label:
-agent-ready
-    |
-    v
-Agent processes issue
+```mermaid
+flowchart LR
+    created[Open issue] --> labeled[Maintainer adds<br/>agent-ready]
+    labeled --> scan[Scheduled or manual scan]
+    scan --> dedupe{Eligible and<br/>not already queued?}
+    dedupe -->|yes| queued[Queue one job]
+    dedupe -->|no| skipped[Skip safely]
 ```
 
 ## Polling
@@ -216,21 +224,29 @@ npm run build
 
 ## Issue workflow
 
-```text
-1. detect eligible issue
-2. mark job as claimed
-3. clone repository
-4. create branch agent/issue-N
-5. retrieve issue context
-6. invoke Codex
-7. inspect resulting diff
-8. run deterministic validation
-9. if validation passes:
-      commit
-      push
-      create PR
-10. record result
-11. clean workspace
+```mermaid
+flowchart TD
+    detected[Eligible issue detected] --> claim{Claim job in SQLite}
+    claim -->|duplicate or retry limit| skip[Skip job]
+    claim -->|claimed| clone[Clone configured base branch]
+    clone --> branch[Create agent/issue-N]
+    branch --> context[Retrieve title, body, and comments]
+    context --> run[Run codex exec]
+    run --> auth{Authentication valid?}
+    auth -->|no| authRequired[Record auth_required]
+    auth -->|yes| changed{Repository changed?}
+    changed -->|no| ignored[Record ignored]
+    changed -->|yes| validate[Run trusted validation commands]
+    validate --> result{Validation passed?}
+    result -->|no| failed[Record failed]
+    result -->|yes| publish[Commit and push agent branch]
+    publish --> pullRequest[Create Pull Request]
+    pullRequest --> completed[Record completed and PR URL]
+
+    authRequired --> cleanup[Clean workspace]
+    ignored --> cleanup
+    failed --> cleanup
+    completed --> cleanup
 ```
 
 ## Codex execution
@@ -327,22 +343,26 @@ The provided image includes Python and Node/npm tooling. Go, Terraform, Packer,
 and any repository-specific validators must be added in a derived image when
 those tools are needed; a missing validator causes validation to fail closed.
 
-## State
+## Persisted job lifecycle
 
 V1 uses SQLite.
 
-Suggested statuses:
-
-```text
-pending
-running
-failed
-completed
-ignored
-auth_required
+```mermaid
+stateDiagram-v2
+    [*] --> pending: issue accepted
+    pending --> running: worker claims job
+    failed --> running: retry below attempt limit
+    running --> completed: validation and PR succeed
+    running --> failed: processing or validation fails
+    running --> ignored: no repository changes
+    running --> auth_required: authentication fails
+    completed --> [*]
+    ignored --> [*]
+    auth_required --> [*]
 ```
 
-SQLite is enough because V1 has one worker.
+SQLite preserves these states across container restarts and is enough because
+V1 has one worker.
 
 ## Retry policy
 
@@ -646,17 +666,15 @@ For a single-worker personal daemon, Python performance is therefore unlikely to
 
 V1 is successful when this works:
 
-```text
-1. Create GitHub Issue
-2. Add label: agent-ready
-3. Agent detects issue
-4. Repository is cloned
-5. Codex attempts a fix
-6. Validation passes
-7. Branch is pushed
-8. Pull Request appears
-9. Human reviews PR
-```
+1. Create a GitHub Issue.
+2. Add the `agent-ready` label.
+3. Confirm the agent detects the issue.
+4. Confirm the repository is cloned from the configured base branch.
+5. Let Codex investigate and produce a focused change.
+6. Require deterministic validation to pass.
+7. Confirm the `agent/issue-N` branch is pushed.
+8. Review the generated Pull Request and validation summary.
+9. Let a human decide whether to merge.
 
 Everything after that is an optimization.
 
