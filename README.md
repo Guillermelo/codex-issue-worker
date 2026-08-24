@@ -1,53 +1,68 @@
 # Self-Hosted GitHub Issue Agent
 
-A lightweight self-hosted agent that watches GitHub repositories for eligible issues, clones the repository, asks OpenAI Codex CLI to solve the issue, runs validation, and opens a Pull Request.
+A small Docker service that turns labeled GitHub issues into reviewed Pull
+Requests:
 
-## Why this project uses Codex CLI
+```text
+agent-ready issue -> Codex change -> validation -> agent branch -> Pull Request
+```
 
-This project intentionally invokes the locally installed Codex CLI with
-`codex exec`. It does not implement an OpenAI API integration and does not
-require an `OPENAI_API_KEY` when Codex is authenticated with the existing
-ChatGPT/Codex login.
+It polls an explicit repository allowlist, gives each job a clean workspace,
+stores job state in SQLite, and never merges automatically.
 
-The goal is to use the Codex access already available through the operator's
-ChatGPT/Codex account instead of creating a separate token-metered OpenAI API
-integration. This does not mean Codex usage is unlimited or universally free:
-an eligible account or subscription is still required, account usage limits
-still apply, and OpenAI product terms may change. If Codex is authenticated
-with an API key instead, that API account's normal billing and limits apply.
+## Why this design
+
+### Codex CLI instead of an OpenAI API integration
+
+The worker invokes the locally installed Codex CLI with `codex exec`. When
+Codex is authenticated with the operator's existing ChatGPT/Codex login, the
+worker does not need an `OPENAI_API_KEY` or create separate token-metered API
+usage.
+
+This does not mean Codex is universally free or unlimited. An eligible account
+or subscription is required, account limits still apply, and product terms may
+change. Using API-key authentication instead would use that API account's
+normal billing and limits.
+
+### Polling instead of webhooks
+
+Polling works on a private machine without exposing a public endpoint, tunnel,
+or webhook secret. A manual scan is also available when immediate processing
+is needed.
+
+### SQLite and one worker
+
+V1 intentionally executes one issue at a time. SQLite provides durable state,
+deduplication, and restart recovery without Redis, queues, or additional
+infrastructure.
+
+### Pull Requests instead of automatic merges
+
+Codex can make mistakes and repository validation cannot cover every behavior.
+Successful changes are pushed only to `agent/issue-N`; a human remains
+responsible for reviewing and merging the Pull Request.
 
 ## Security warning
 
-This worker is privileged automation, not a security boundary. It can read
-issue content, clone source code, run Codex, execute repository validation
-commands, create commits, push branches, and open Pull Requests with the
-permissions of the authenticated GitHub identity.
+This worker is privileged automation, not a security boundary. It can clone
+code, run Codex, execute repository scripts, push branches, and create Pull
+Requests with the permissions of the authenticated GitHub identity.
 
-Run it only on a machine or VM you control, and assume that issue bodies,
-comments, repository files, dependencies, build scripts, and test scripts may
-be untrusted. Container isolation reduces accidental workspace contamination,
-but the container still has network access and persistent GitHub and Codex
-credentials.
-
-Recommended operating rules:
-
-- Use a dedicated GitHub identity or fine-grained credential with access only
-  to the repositories this worker must modify.
-- Do not grant organization administration, production deployment, package
-  publishing, secrets management, or unrelated repository access.
-- Restrict who can add the configured `agent-ready` label. Adding that label is
-  equivalent to requesting an automated code execution job.
-- Keep the repository allowlist small and review every configured repository.
-- Do not mount the Docker socket, SSH keys, cloud credentials, production
-  `.env` files, or host directories containing secrets into the container.
-- Keep the FastAPI port private. V1 has no API authentication, so `/scan` and
-  `/solve` must not be exposed directly to the internet or an untrusted LAN.
-- Protect the Docker host and the named authentication volumes. Anyone who can
-  access them may be able to reuse the stored credentials.
-- Review every generated Pull Request and its CI results before merging. This
-  project never merges automatically.
-- Confirm that using Codex with private repository content is compatible with
-  your organization's data handling and compliance requirements.
+- Use a dedicated GitHub identity or least-privilege credential with access
+  only to the configured repositories.
+- Restrict who can add the `agent-ready` label. Applying it requests an
+  automated code execution job.
+- Treat issues, comments, repository files, dependencies, tests, and build
+  scripts as potentially untrusted.
+- Never mount the Docker socket, production credentials, SSH keys, cloud
+  credentials, or secret-bearing host directories into the container.
+- Keep the API private. It binds to `127.0.0.1` by default and V1 has no API
+  authentication.
+- Protect the Docker host and the persistent GitHub and Codex authentication
+  volumes.
+- Confirm that processing private source code with Codex is compatible with
+  your organization's policies.
+- Review every generated Pull Request and its CI results before merging.
 
 ## Architecture
 
@@ -55,14 +70,14 @@ Recommended operating rules:
 flowchart LR
     subgraph github[GitHub]
         issue[Open issue<br/>agent-ready]
-        branch[Agent branch]
+        branch[agent/issue-N]
         pr[Pull Request]
     end
 
-    subgraph container[Self-hosted Docker container]
+    subgraph agent[Self-hosted Docker agent]
         scheduler[Polling scheduler]
-        api[FastAPI<br/>manual control]
-        queue[Async job queue<br/>single worker]
+        api[FastAPI<br/>manual controls]
+        queue[Single-worker queue]
         worker[Job worker]
         database[(SQLite)]
         gh[GitHub CLI]
@@ -70,613 +85,282 @@ flowchart LR
         validation[Deterministic validation]
     end
 
-    subgraph workspace[Isolated temporary workspace]
-        checkout[Fresh repository clone]
-        changes[Issue-specific changes]
+    subgraph workspace[Isolated workspace]
+        clone[Fresh clone]
+        changes[Focused changes]
     end
 
-    issue -->|poll by label| scheduler
+    issue --> scheduler
     scheduler --> queue
-    api -->|scan or solve| queue
+    api --> queue
     queue --> worker
     worker <--> database
     worker --> gh
-    gh -->|clone configured base branch| checkout
-    worker -->|issue context| codex
+    gh --> clone
+    worker --> codex
+    clone --> changes
     codex --> changes
-    checkout --> changes
     changes --> validation
     validation -->|pass| gh
-    gh -->|commit and push| branch
+    gh --> branch
     branch --> pr
-    gh -->|create, never merge| pr
 ```
 
-The agent is designed to run inside Docker on a personal computer, home server, VPS, or Linux VM.
-
-## Goals
-
-- Run as a Docker container.
-- Authenticate GitHub with `gh`.
-- Authenticate Codex CLI with a ChatGPT/Codex login.
-- Monitor one or more GitHub repositories.
-- Detect issues labeled `agent-ready`.
-- Support polling, manual scans, and later GitHub webhooks.
-- Clone each repository into a temporary workspace.
-- Create one branch per issue.
-- Invoke Codex CLI non-interactively.
-- Run deterministic validation.
-- Push successful changes and create a Pull Request.
-- Keep state in SQLite.
-- Process one issue at a time in V1.
-- Never push directly to `main`.
-- Never auto-merge in V1.
-
-## Trigger model
-
-Recommended trigger:
-
-```text
-agent-ready
-```
-
-Flow:
+## Job workflow
 
 ```mermaid
-flowchart LR
-    created[Open issue] --> labeled[Maintainer adds<br/>agent-ready]
-    labeled --> scan[Scheduled or manual scan]
-    scan --> dedupe{Eligible and<br/>not already queued?}
-    dedupe -->|yes| queued[Queue one job]
-    dedupe -->|no| skipped[Skip safely]
+flowchart TD
+    issue[Eligible issue] --> claim{Claim in SQLite}
+    claim -->|duplicate or retry limit| skip[Skip]
+    claim -->|claimed| clone[Clone configured base branch]
+    clone --> branch[Create agent/issue-N]
+    branch --> context[Read issue and comments]
+    context --> codex[Run codex exec]
+    codex --> changed{Changes produced?}
+    changed -->|no| ignored[Record ignored]
+    changed -->|yes| validate[Run trusted validation]
+    validate --> passed{Passed?}
+    passed -->|no| failed[Record failed]
+    passed -->|yes| publish[Commit and push]
+    publish --> pr[Create Pull Request]
+    pr --> completed[Record completed]
+
+    ignored --> cleanup[Clean workspace]
+    failed --> cleanup
+    completed --> cleanup
 ```
 
-## Polling
+Authentication failures are recorded as `auth_required` and are not retried
+indefinitely.
 
-Polling is the default for V1.
+## Quick Start
 
-Every few minutes the agent searches configured repositories for open issues labeled `agent-ready`.
+### 1. Configure the repository
 
-Advantages:
-
-- no public endpoint required;
-- works behind NAT;
-- ideal for a home computer;
-- pending issues are recovered when the computer comes back online;
-- simpler than webhook infrastructure.
-
-Suggested initial interval: 300 seconds.
-
-## Webhooks
-
-Add webhooks later for near-instant processing.
-
-Recommended event:
-
-```text
-issues
-action: labeled
-label: agent-ready
-```
-
-If the machine runs at home, expose the endpoint through Cloudflare Tunnel, ngrok, or another HTTPS tunnel rather than direct port forwarding.
-
-## Manual control
-
-Suggested API:
-
-```text
-GET  /health
-GET  /jobs
-
-POST /scan
-POST /solve
-```
-
-`POST /webhook/github` is intentionally reserved for a later release. Polling and
-the two manual endpoints are the V1 trigger mechanisms.
-
-## Configuration
-
-Example `config.yaml`:
+Edit `config.yaml`:
 
 ```yaml
 poll_interval_seconds: 300
 max_concurrent_jobs: 1
 issue_label: agent-ready
 workspace_root: /workspace
+database_path: /data/agent.db
+max_attempts: 2
+command_timeout_seconds: 1800
+codex_timeout_seconds: 3600
+comment_on_failure: false
+keep_workspace_on_failure: false
 
 repos:
-  - owner/backend-api
-  - owner/another-service
-  - owner/infrastructure
+  - repo: owner/repository
+    base_branch: develop
 ```
 
-## Repository-specific instructions
+`base_branch` is the branch cloned for the job and used as the Pull Request
+base. If it is omitted, GitHub's default repository branch is used.
 
-Each target repo should ideally include `AGENTS.md`.
+Only repositories listed under `repos` can be scanned or submitted through the
+API.
 
-Example:
-
-```md
-# AGENTS.md
-
-## Setup
-
-npm install
-
-## Validation
-
-npm run lint
-npm test
-npm run build
-
-## Rules
-
-- Prefer the smallest safe change.
-- Do not modify unrelated files.
-- Add regression tests for bug fixes when appropriate.
-- Do not change public APIs unless required by the issue.
-- Do not introduce new dependencies unless necessary.
-- Never commit credentials or secrets.
-- Keep each Pull Request focused on one issue.
-```
-
-## Issue workflow
-
-```mermaid
-flowchart TD
-    detected[Eligible issue detected] --> claim{Claim job in SQLite}
-    claim -->|duplicate or retry limit| skip[Skip job]
-    claim -->|claimed| clone[Clone configured base branch]
-    clone --> branch[Create agent/issue-N]
-    branch --> context[Retrieve title, body, and comments]
-    context --> run[Run codex exec]
-    run --> auth{Authentication valid?}
-    auth -->|no| authRequired[Record auth_required]
-    auth -->|yes| changed{Repository changed?}
-    changed -->|no| ignored[Record ignored]
-    changed -->|yes| validate[Run trusted validation commands]
-    validate --> result{Validation passed?}
-    result -->|no| failed[Record failed]
-    result -->|yes| publish[Commit and push agent branch]
-    publish --> pullRequest[Create Pull Request]
-    pullRequest --> completed[Record completed and PR URL]
-
-    authRequired --> cleanup[Clean workspace]
-    ignored --> cleanup
-    failed --> cleanup
-    completed --> cleanup
-```
-
-## Codex execution
-
-Conceptually:
+### 2. Configure local environment overrides
 
 ```bash
-codex exec "
-Read AGENTS.md first.
-
-Solve GitHub issue #42.
-
-Requirements:
-- understand the root cause before editing
-- make the smallest safe fix
-- add regression tests when appropriate
-- respect repository validation instructions
-- do not modify unrelated code
-- do not commit credentials or secrets
-"
+cp .env.example .env
 ```
 
-The wrapper remains responsible for Git operations, issue state, validation policy, retries, PR creation, logging, and cleanup.
+The relevant defaults are:
 
-Codex is responsible for reasoning about and editing the repository.
-
-## Git workflow
-
-Each issue gets a dedicated branch:
-
-```text
-agent/issue-42
+```env
+AGENT_BIND_ADDRESS=127.0.0.1
+AGENT_PORT=8080
 ```
 
-After Codex completes, inspect the diff and run validation. If it passes:
+If port `8080` is already occupied, change `AGENT_PORT`, for example to `8081`.
+Do not bind to `0.0.0.0` unless the API is protected by a firewall, private
+network, or authenticated reverse proxy.
 
-```bash
-git add .
-git commit -m "fix: resolve issue #42"
-git push origin agent/issue-42
-```
-
-Create the PR:
-
-```bash
-gh pr create   --repo owner/backend-api   --title "Fix #42"   --body "Closes #42"
-```
-
-## Validation
-
-Codex should not be the only validator.
-
-Examples:
-
-### Node.js
-
-```bash
-npm test
-npm run lint
-npm run build
-```
-
-### Python
-
-```bash
-pytest
-ruff check .
-mypy .
-```
-
-### Go
-
-```bash
-go test ./...
-go vet ./...
-```
-
-### Terraform
-
-```bash
-terraform fmt -check -recursive
-terraform validate
-tflint
-```
-
-### Packer
-
-```bash
-packer fmt -check .
-packer validate .
-```
-
-The provided image includes Python and Node/npm tooling. Go, Terraform, Packer,
-and any repository-specific validators must be added in a derived image when
-those tools are needed; a missing validator causes validation to fail closed.
-
-## Persisted job lifecycle
-
-V1 uses SQLite.
-
-```mermaid
-stateDiagram-v2
-    [*] --> pending: issue accepted
-    pending --> running: worker claims job
-    failed --> running: retry below attempt limit
-    running --> completed: validation and PR succeed
-    running --> failed: processing or validation fails
-    running --> ignored: no repository changes
-    running --> auth_required: authentication fails
-    completed --> [*]
-    ignored --> [*]
-    auth_required --> [*]
-```
-
-SQLite preserves these states across container restarts and is enough because
-V1 has one worker.
-
-## Retry policy
-
-Initial limits:
-
-```text
-max attempts per issue: 2
-max concurrent jobs: 1
-```
-
-If an issue fails twice, mark it failed until manually retried.
-
-## Authentication
-
-Inside the container:
-
-```bash
-gh auth login
-codex login
-```
-
-Persist GitHub CLI and Codex authentication directories as Docker volumes.
-
-The authenticated GitHub identity defines the worker's effective permissions.
-The repository allowlist limits what the application selects, but it does not
-reduce the underlying token scopes. Prefer least-privilege GitHub access rather
-than relying on the allowlist as the only control.
-
-The default setup expects interactive `codex login` authentication backed by
-the operator's ChatGPT/Codex account. It intentionally does not configure or
-read an OpenAI API key.
-
-The worker should detect authentication failures and mark the job `auth_required` instead of retrying forever.
-
-## Suggested project structure
-
-```text
-issue-agent/
-|
-|-- src/
-|   |-- main.py
-|   |-- api.py
-|   |-- worker.py
-|   |-- scheduler.py
-|   |-- github_client.py
-|   |-- codex_runner.py
-|   |-- git_service.py
-|   |-- validation.py
-|   |-- database.py
-|   `-- models.py
-|
-|-- tests/
-|-- config.yaml
-|-- Dockerfile
-|-- docker-compose.yml
-|-- requirements.txt
-|-- .env.example
-|-- .gitignore
-`-- README.md
-```
-
-## Docker Compose
-
-Conceptual configuration:
-
-```yaml
-services:
-  agent:
-    build: .
-    restart: unless-stopped
-
-    ports:
-      - "127.0.0.1:8080:8080"
-
-    volumes:
-      - agent-data:/data
-      - agent-workspace:/workspace
-      - agent-gh-config:/root/.config/gh
-      - agent-codex-config:/root/.codex
-
-    environment:
-      CONFIG_FILE: /app/config.yaml
-      DATABASE_URL: sqlite:////data/agent.db
-
-volumes:
-  agent-data:
-  agent-workspace:
-  agent-gh-config:
-  agent-codex-config:
-```
-
-## Running
+### 3. Build and start
 
 ```bash
 docker compose build
 docker compose up -d
-docker compose logs -f
 ```
 
-First-time login:
+### 4. Authenticate GitHub and Codex
 
 ```bash
 docker compose exec agent gh auth login
 docker compose exec agent codex login
 ```
 
-## Quick Start
+Authentication is stored in named Docker volumes and survives container
+restarts. The GitHub identity must be able to read the configured repository,
+push an agent branch, and create a Pull Request.
 
-1. Build and start the service:
+Check authentication when needed:
 
-   ```bash
-   docker compose build
-   docker compose up -d
-   ```
-
-   The API listens on `127.0.0.1:8080` by default. If that port is occupied,
-   set a different one in `.env` before starting, for example
-   `AGENT_PORT=8081`, and use that port in the `curl` commands below.
-
-   `AGENT_BIND_ADDRESS` defaults to `127.0.0.1` because V1 has no API
-   authentication. Do not change it to `0.0.0.0` unless access is protected by
-   a trusted firewall, private network, or authenticated reverse proxy.
-
-2. Authenticate GitHub and Codex once. Their login directories are stored in
-   named Docker volumes and survive container restarts:
-
-   ```bash
-   docker compose exec agent gh auth login
-   docker compose exec agent codex login
-   ```
-
-3. Edit `config.yaml` and replace `owner/repository` with each allowed GitHub
-   repository. The short form uses safe validation detection:
-
-   ```yaml
-   repos:
-     - your-name/your-repository
-   ```
-
-   Trusted validation commands can instead be set explicitly per repository:
-
-   ```yaml
-   repos:
-     - repo: your-name/your-repository
-       base_branch: Stateless+Gracefull
-       validation_commands:
-         - pytest
-         - ruff check .
-   ```
-
-   Commands are parsed as argument lists and run without a shell, so shell
-   operators such as pipes and redirects are not supported. Apply configuration
-   changes with:
-
-   ```bash
-   docker compose restart agent
-   ```
-
-4. Add the `agent-ready` label to an open issue in an allowed repository. Wait
-   for the polling interval, or trigger a scan immediately:
-
-   ```bash
-   curl -X POST http://localhost:8080/scan
-   ```
-
-   A specific allowed issue can also be queued manually:
-
-   ```bash
-   curl -X POST http://localhost:8080/solve \
-     -H 'Content-Type: application/json' \
-     -d '{"repo":"your-name/your-repository","issue":42}'
-   ```
-
-5. Inspect service logs and persisted job state:
-
-   ```bash
-   docker compose logs -f agent
-   curl http://localhost:8080/jobs
-   ```
-
-   A successful job reports `status: completed` and its `pr_url`. Open that URL
-   to review the Pull Request; the agent never merges it.
-
-## Implemented safety controls
-
-V1 enforces:
-
-- one worker only;
-- explicit repository allowlist;
-- only `agent-ready` issues;
-- no direct pushes to protected branches;
-- no automatic merge;
-- no credentials bundled in the image or repository;
-- no commands taken from issue text or comments;
-- per-job isolated workspaces;
-- maximum attempts;
-- execution timeout;
-- cleanup after each job;
-- logs without credentials or tokens.
-
-These controls do not make arbitrary repository code safe. Validation commands
-come from trusted local configuration or conservative file-based detection, but
-commands such as `npm test` and `pytest` execute code from the cloned
-repository. Use a dedicated host or VM when processing repositories that are
-not fully trusted. Webhooks and webhook signature verification are outside V1.
-
-## Workspace isolation
-
-Each job receives a unique directory:
-
-```text
-/workspace/owner-repo-42-<job-id>/
+```bash
+docker compose exec agent gh auth status
+docker compose exec agent codex login status
 ```
 
-Delete it after completion.
+### 5. Restart after configuration changes
 
-Do not reuse dirty checkouts between issues.
-
-## V1 scope
-
-Use:
-
-```text
-Docker
-Python
-FastAPI
-SQLite
-Git
-GitHub CLI
-Codex CLI
-Polling
-Manual /scan
-Manual /solve
-Issue label filtering
-Temporary clone
-Codex execution
-Validation
-Branch creation
-PR creation
+```bash
+docker compose restart agent
 ```
 
-Do not add in V1:
+### 6. Process an issue
 
-```text
-Redis
-RabbitMQ
-Kafka
-Kubernetes
-LangChain
-multi-agent orchestration
-vector databases
-complex dashboards
-automatic merging
-production AWS access
+Add the configured `agent-ready` label to an open issue. The scheduler will
+detect it at the next polling interval, or a scan can be triggered immediately:
+
+```bash
+curl -X POST http://127.0.0.1:8080/scan
 ```
 
-## Phase 2
+To submit one allowed issue directly:
 
-After V1 is reliable:
-
-- GitHub webhooks;
-- Cloudflare Tunnel;
-- webhook signature validation;
-- richer per-repo configuration;
-- multiple workers;
-- job cancellation;
-- better logs;
-- PR reviewer agent;
-- CI failure follow-up;
-- automatic issue triage.
-
-## Why Python?
-
-Python is not mandatory.
-
-The service could also be written in Go, TypeScript/Node.js, Rust, Java, or another general-purpose language.
-
-Python is recommended for V1 because this application is mostly orchestration:
-
-```text
-HTTP
-+
-subprocess execution
-+
-GitHub API/CLI
-+
-SQLite
-+
-filesystem
-+
-background jobs
+```bash
+curl -X POST http://127.0.0.1:8080/solve \
+  -H 'Content-Type: application/json' \
+  -d '{"repo":"owner/repository","issue":42}'
 ```
 
-Python handles all of that with very little code.
+Replace `8080` when `AGENT_PORT` uses a different value.
 
-This is not a high-throughput server. Most execution time will be spent waiting for GitHub, `git clone`, Codex inference, dependency installation, tests, and builds rather than executing Python.
+### 7. Inspect progress
 
-For a single-worker personal daemon, Python performance is therefore unlikely to matter.
+```bash
+docker compose logs -f agent
+curl http://127.0.0.1:8080/jobs
+```
 
-## Success criteria
+A successful job has `status: completed` and a `pr_url`. Open that URL to
+review the generated summary, changed files, validation commands, and code.
 
-V1 is successful when this works:
+## Configuration reference
 
-1. Create a GitHub Issue.
-2. Add the `agent-ready` label.
-3. Confirm the agent detects the issue.
-4. Confirm the repository is cloned from the configured base branch.
-5. Let Codex investigate and produce a focused change.
-6. Require deterministic validation to pass.
-7. Confirm the `agent/issue-N` branch is pushed.
-8. Review the generated Pull Request and validation summary.
-9. Let a human decide whether to merge.
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `poll_interval_seconds` | `300` | Time between GitHub scans; minimum 10 seconds. |
+| `max_concurrent_jobs` | `1` | Fixed to one in V1. |
+| `issue_label` | `agent-ready` | Label required for polling. |
+| `workspace_root` | `/workspace` | Root for isolated temporary clones. |
+| `database_path` | `/data/agent.db` | Persistent SQLite database. |
+| `max_attempts` | `2` | Maximum processing attempts per issue. |
+| `command_timeout_seconds` | `1800` | Timeout for Git, GitHub, and validation commands. |
+| `codex_timeout_seconds` | `3600` | Timeout for one Codex execution. |
+| `comment_on_failure` | `false` | Post a generic failure comment on the issue. |
+| `keep_workspace_on_failure` | `false` | Preserve failed workspaces for debugging. |
 
-Everything after that is an optimization.
+Repository entries accept:
+
+```yaml
+repos:
+  - repo: owner/repository
+    base_branch: develop
+    validation_commands:
+      - npm run test
+      - npm run lint
+```
+
+Validation commands are trusted local configuration. They are split into
+arguments and executed without `shell=True`; shell operators such as pipes and
+redirections are not supported. Commands are never read from issue content.
+
+## Automatic validation detection
+
+When `validation_commands` is omitted, the worker selects commands from files
+in the cloned repository:
+
+| Repository file | Commands selected when applicable |
+| --- | --- |
+| `package.json` | Existing `test`, `lint`, and `build` npm scripts. |
+| `pyproject.toml` with tests | `pytest` |
+| `go.mod` | `go test ./...` |
+| `*.tf` | `terraform fmt -check -recursive`, `terraform validate` |
+| `*.pkr.hcl` | `packer fmt -check .`, `packer validate .` |
+
+Validation fails closed when no command can be configured or detected. The
+base image includes Python and Node/npm. Go, Terraform, Packer, or other tools
+must be added to a derived image when a target repository needs them.
+
+Target repositories should include an `AGENTS.md` with their setup, validation,
+and contribution rules. Codex is explicitly instructed to read it before
+editing.
+
+## API
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `GET` | `/health` | Service status and queued job count. |
+| `GET` | `/jobs` | Persisted jobs and results. |
+| `POST` | `/scan` | Scan every configured repository now. |
+| `POST` | `/solve` | Queue one issue from an allowed repository. |
+
+`POST /webhook/github` is not implemented in V1.
+
+Job statuses are:
+
+| Status | Meaning |
+| --- | --- |
+| `pending` | Accepted and waiting for the worker. |
+| `running` | Claimed by the worker. |
+| `failed` | Codex, Git, or validation failed. |
+| `completed` | Branch pushed and Pull Request created. |
+| `ignored` | Codex completed without repository changes. |
+| `auth_required` | GitHub or Codex must be authenticated again. |
+
+## Operational notes
+
+- Each issue uses a unique `/workspace/owner-repo-N-<id>` directory.
+- Workspaces are deleted after every job unless failed workspace retention is
+  explicitly enabled.
+- Existing jobs and Pull Requests are detected to prevent duplicate work.
+- Branches always use `agent/issue-N`; direct pushes to `main` and `master` are
+  rejected.
+- A Pull Request is created only when changes exist and deterministic
+  validation passes.
+- SQLite data, workspaces, and authentication directories use persistent Docker
+  volumes.
+- V1 has no webhooks, automatic merge, multiple workers, remote API
+  authentication, or arbitrary job cancellation.
+
+## Troubleshooting
+
+### Port already allocated
+
+Set an unused host port in `.env`, then recreate the service:
+
+```env
+AGENT_PORT=8081
+```
+
+```bash
+docker compose up -d --force-recreate
+```
+
+### Authentication required
+
+Authenticate again, then submit the issue through `/solve`:
+
+```bash
+docker compose exec agent gh auth login
+docker compose exec agent codex login
+```
+
+### No Pull Request was created
+
+Inspect the persisted status and logs:
+
+```bash
+curl http://127.0.0.1:8080/jobs
+docker compose logs --tail=200 agent
+```
+
+Common causes are missing authentication, no Codex changes, unavailable
+validation tools, failed validation, a command timeout, or the retry limit.
 
 ## License
 
